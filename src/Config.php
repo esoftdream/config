@@ -3,20 +3,25 @@
 namespace Esoftdream;
 
 use CodeIgniter\Database\BaseConnection;
+use CodeIgniter\Config\Services;
 use CodeIgniter\I18n\Time;
 
 class Config
 {
     private BaseConnection $db;
     private string $table = 'sys_config';
+    private $cache;
+    private $encrypter;
 
     public function __construct()
     {
         $this->db = \Config\Database::connect();
+        $this->cache = Services::cache();
+        $this->encrypter = Services::encrypter();
     }
 
     /**
-     * Menambahkan atau mengupdate konfigurasi berdasarkan key.
+     * Menambahkan atau mengupdate konfigurasi berdasarkan key dengan caching & enkripsi.
      *
      * @param mixed $value
      */
@@ -29,30 +34,39 @@ class Config
 
         $data = [
             'config_key'              => $key,
-            'config_value'            => $this->prepareValue($value),
+            'config_value'            => $this->encryptData($value), // Enkripsi nilai sebelum disimpan
             'config_type'             => gettype($value),
             'config_updated_datetime' => Time::now()->toDateTimeString(),
         ];
 
         if ($exists) {
-            // Update jika sudah ada
-            return $builder->where('config_key', $key)->update($data);
+            $result = $builder->where('config_key', $key)->update($data);
+        } else {
+            $data['config_created_datetime'] = Time::now()->toDateTimeString();
+            $result = $builder->insert($data);
         }
-        // Insert jika belum ada
-        $data['config_created_datetime'] = Time::now()->toDateTimeString();
 
-        return $builder->insert($data);
+        if ($result) {
+            // Simpan ke cache setelah update
+            $this->cache->save("config_{$key}", $value, 3600); // Cache selama 1 jam
+        }
+
+        return $result;
     }
 
     /**
-     * Mengambil nilai konfigurasi berdasarkan key.
+     * Mengambil nilai konfigurasi berdasarkan key dengan caching.
      *
      * @return mixed|null
      */
     public function get(string $key)
     {
-        $builder = $this->db->table($this->table);
+        // Cek apakah ada di cache terlebih dahulu
+        if ($this->cache->get("config_{$key}")) {
+            return $this->cache->get("config_{$key}");
+        }
 
+        $builder = $this->db->table($this->table);
         $result = $builder
             ->select('config_value, config_type')
             ->where('config_key', $key)
@@ -60,21 +74,47 @@ class Config
             ->getRow();
 
         if ($result) {
-            // Return value berdasarkan type
-            return $this->parseValue($result->config_value, $result->config_type);
+            $decryptedValue = $this->decryptData($result->config_value); // Dekripsi sebelum dikembalikan
+            $parsedValue = $this->parseValue($decryptedValue, $result->config_type);
+
+            // Simpan ke cache untuk pemanggilan selanjutnya
+            $this->cache->save("config_{$key}", $parsedValue, 3600);
+
+            return $parsedValue;
         }
 
         return null;
     }
 
     /**
-     * Menghapus konfigurasi berdasarkan key.
+     * Menghapus konfigurasi berdasarkan key, serta menghapus cache-nya.
      */
     public function forget(string $key): bool
     {
         $builder = $this->db->table($this->table);
 
-        return $builder->where('config_key', $key)->delete();
+        $deleted = $builder->where('config_key', $key)->delete();
+        if ($deleted) {
+            $this->cache->delete("config_{$key}"); // Hapus dari cache
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * Mengenkripsi data sebelum disimpan ke database.
+     */
+    private function encryptData($value): string
+    {
+        return base64_encode($this->encrypter->encrypt($this->prepareValue($value)));
+    }
+
+    /**
+     * Mendekripsi data setelah diambil dari database.
+     */
+    private function decryptData($encryptedValue)
+    {
+        return $this->encrypter->decrypt(base64_decode($encryptedValue));
     }
 
     /**
